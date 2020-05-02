@@ -12,28 +12,28 @@ def get_video_writer(save_video_path, width, height):
                 pass
 
         return MuteVideoWriter()
-def main(video_path,save_video):
+def draw_lines(video_path,save_video,save_frames=True):
     if os.path.isdir(video_path):
         path_list = os.listdir(video_path)
         for video in path_list:
+            frame_num=0
             video_base_name = os.path.splitext(video)[0]
             capture = cv2.VideoCapture(os.path.join(video_path, video))
-            video_writer = get_video_writer(os.path.join(save_video,  video),
+            video_writer = get_video_writer(os.path.join(save_video,  'drawn_videos',video_base_name+'_drawnlines.mp4'),
                                             capture.get(cv2.CAP_PROP_FRAME_WIDTH),
                                             capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    else:
-        capture = cv2.VideoCapture(os.path.join(video_path))
-        video_writer = get_video_writer(os.path.join(save_video),
-                                        capture.get(cv2.CAP_PROP_FRAME_WIDTH),
-                                        capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        while True:
-            ret, frame = capture.read()
 
-            if not ret:
-                break
-            cv2.line(frame,(0,360),(1280,360),(0,255,0),1)
-            cv2.line(frame, (640, 0), (640, 720), (0, 255, 0), 1)
-            video_writer.write(frame)
-        video_writer.release()
+            while True:
+                ret, frame = capture.read()
+                if save_frames:
+                    img_save_path=os.path.join(save_video,'raw_frames',video_base_name+'_{:06d}.jpg'.format(frame_num))
+                    cv2.imwrite(img_save_path,frame)
+                if not ret:
+                    break
+                frame_num+=1
+                cv2.line(frame,(0,360),(1280,360),(0,255,0),1)
+                cv2.line(frame, (640, 0), (640, 720), (0, 255, 0), 1)
+                video_writer.write(frame)
+            video_writer.release()
 if __name__ == '__main__':
-    main('/home/rvlab/Desktop/M19040313550500131.mp4','/home/rvlab/Desktop/drawn_lines.mp4')
+    draw_lines('/home/rvlab/Documents/DRDvideos/','/home/rvlab/Documents/DRDvideo_processed/')
