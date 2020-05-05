@@ -10,6 +10,24 @@ class Tracklet(object):
     def update(self,bbox,frame_num):
         self.tracklet.append(bbox)
         self.frame_history.append(frame_num)
+def crop_imgs(img, x_c, y_c, window_size):
+    x_base = 0
+    y_base = 0
+    padded_img = img
+    half_w=int(window_size[0]//2)
+    half_h=int(window_size[1]//2)
+    if x_c < half_w:
+        padded_img = cv2.copyMakeBorder(padded_img, 0, 0, half_w, 0, borderType=cv2.BORDER_REFLECT)
+        x_base = half_w
+    if x_c > img.shape[1] - half_w:
+        padded_img = cv2.copyMakeBorder(padded_img, 0, 0, 0, half_w, borderType=cv2.BORDER_REFLECT)
+    if y_c < half_h:
+        padded_img = cv2.copyMakeBorder(padded_img, half_h, 0, 0, 0, borderType=cv2.BORDER_REFLECT)
+        y_base = half_h
+    if y_c > img.shape[0] - half_h:
+        padded_img = cv2.copyMakeBorder(padded_img, 0, half_h, 0, 0, borderType=cv2.BORDER_REFLECT)
+    return padded_img[int(y_base + y_c - half_h): int(y_base + y_c + half_h),
+           int(x_base + x_c - half_w): int(x_base + x_c + half_w), :]
 def generate_segments(root_path):
     label_path=os.path.join(root_path,'annotations','raw_labels')
     label_list=os.listdir(label_path)
@@ -37,8 +55,8 @@ def generate_segments(root_path):
                 else:
                     tracklets[obj_id+action].update(bbox,frame_num)
 
-        crop_patches(tracklets,save_path)
-def crop_patches(tracklets,save_path):
+        extract_videos(tracklets,save_path)
+def extract_videos(tracklets,save_path):
     rawframes_dir='/home/rvlab/Documents/DRDvideo_processed/raw_frames/'
     for tracklet in tracklets.values():
         data=None
@@ -54,7 +72,7 @@ def crop_patches(tracklets,save_path):
             video_writer = cv2.VideoWriter(
                 os.path.join(save_path, action,
                              '{}_{}_{}_{}.mp4'.format(base_video_name, target_id, start_frame, end_frame)),
-                cv2.VideoWriter_fourcc(*'mp4v'), 14, (32, 64))
+                cv2.VideoWriter_fourcc(*'mp4v'), 14, (64, 64))
             for idx,frame in enumerate(tracklet.frame_history):
                 bbox=list(map(int, tracklet.tracklet[idx]))
                 row= [int(frame)]+[int(target_id)]+ bbox
@@ -80,9 +98,9 @@ def crop_patches(tracklets,save_path):
                     print('Frame {} Not Found'.format(
                         os.path.join(rawframes_dir, base_video_name + '_{:06d}.jpg'.format(int(detection[0])))))
                     break
-                patch = crop(img, x_c, y_c, max(w, h))
+                patch = crop_imgs(img, x_c, y_c, [w, h])
 
-                patch = cv2.resize(patch, (32, 64))
+                patch = cv2.resize(patch, (64, 64))
                 video_writer.write(patch)
 
             video_writer.release()
