@@ -36,86 +36,80 @@ def init_coco_dict():
     }
 
 
-def to_coco(mot_path):
+def to_coco(root_path):
     train_dict = init_coco_dict()
     val_dict = init_coco_dict()
 
     image_count = 0
     instance_count = 0
+    cut_y=80
+    images_path = os.path.join(root_path, 'raw_frames')
+    label_path = os.path.join(root_path, 'annotations', 'raw_labels')
+    labels = os.listdir(label_path)
+    labels.sort()
 
-    images_path = os.path.join(mot_path, 'images')
-    instances_path = os.path.join(mot_path, 'instances')
+    for label in labels:
+        id_pool = []
+        print('Processing label {}'.format(label))
+        o = open(os.path.join(label_path, label), 'r')
+        label_base_name = os.path.splitext(label)[0]
+        lines = o.readlines()
+        imgs_num = len(lines)
 
-    seqs = os.listdir(images_path)
-    seqs.sort()
-
-    for seq in seqs:
-        print('Processing sequence {}'.format(seq))
-        image_filenames = os.listdir(os.path.join(images_path, seq))
-        image_filenames.sort()
-
-        for image_ind, image_filename in enumerate(image_filenames):
-            if (image_filename[-3:] != 'jpg'):
-                print('Ignoring file {}'.format(image_filename))
-                continue
-            print('Processing image {}/{}'.format(seq, image_filename))
+        for line in lines:
+            line_list = line.split(',')
+            frame_num = line_list[0]
             image_count += 1
-            instance_filename = image_filename[:-3] + 'png'
-            instance_img = np.array(Image.open(open(os.path.join(instances_path, seq, instance_filename), 'rb')))
+            frame_img = label_base_name + '_{:06d}.jpg'.format(int(frame_num))
 
             image_dict = {
                 'license': 1,
-                'file_name': seq + '/' + image_filename,
+                'file_name': frame_img,
                 'coco_url': '',
-                'height': instance_img.shape[0],
-                'width': instance_img.shape[1],
+                'height': 640,
+                'width': 640,
                 'date_captured': '',
                 'flickr_url': '',
                 'id': image_count
             }
-
-            if image_ind >= 0.8 * len(image_filenames):
+            # train_dict['images'].append(image_dict)
+            if image_count >= 0.8 * imgs_num:
                 val_dict['images'].append(image_dict)
             else:
                 train_dict['images'].append(image_dict)
+            obj_num = line_list[1]
+            for obj in range(int(obj_num)):
+                print(obj)
+                instance_count += 1
+                bbox = line_list[3 + 6 * obj:7 + 6 * obj]
+                instance_dict = {
+                    'iscrowd': 0,
+                    'image_id': image_count,
+                    'category_id': 1,
+                    'id': instance_count
+                }
 
-            obj_ids = np.unique(instance_img)
+                instance_dict['segmentation'] = []
+                x1 = int(bbox[0])
+                y1 = int(bbox[1])-cut_y
+                w = int(bbox[2])
+                h = int(bbox[3])
 
-            image = cv2.imread(os.path.join(images_path, seq, image_filename))
-            for obj_id in obj_ids:
-                if obj_id // 1000 == 2:
-                    instance_count += 1
-                    obj_instance_id = obj_id % 1000
-                    instance_dict = {
-                        'iscrowd': 0,
-                        'image_id': image_count,
-                        'category_id': 1,
-                        'id': instance_count
-                    }
-                    mask = np.where(instance_img == obj_id, 1, 0).astype(np.uint8)
-                    instance_dict['area'] = cv2.countNonZero(mask)
-                    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                    image = cv2.drawContours(image, contours, -1, (0, 255, 0), 3)
+                instance_dict['bbox'] = [x1, y1, w, h]
+                if image_count >= 0.8 * imgs_num:
+                    val_dict['annotations'].append(instance_dict)
+                else:
+                    train_dict['annotations'].append(instance_dict)
 
-                    instance_dict['segmentation'] = [c.reshape(-1).tolist() for c in contours if len(c) > 2]
-                    x1 = int(min([np.min(c[:, 0, 0]) for c in contours]))
-                    y1 = int(min([np.min(c[:, 0, 1]) for c in contours]))
-                    x2 = int(max([np.max(c[:, 0, 0]) for c in contours]))
-                    y2 = int(max([np.max(c[:, 0, 1]) for c in contours]))
-                    instance_dict['bbox'] = [x1, y1, x2, y2]
-                    if len(instance_dict['segmentation']) > 0:
-                        if image_ind >= 0.8 * len(image_filenames):
-                            val_dict['annotations'].append(instance_dict)
-                        else:
-                            train_dict['annotations'].append(instance_dict)
 
-            # image = image / 255.
-            # plt.imshow(image)
-            # plt.show()
-            # break
-    json.dump(train_dict, open('instances_train.json', 'w+'))
-    json.dump(val_dict, open('instances_val.json', 'w+'))
+        # image = image / 255.
+        # plt.imshow(image)
+        # plt.show()
+        # break
 
+
+    json.dump(train_dict, open(root_path+'annotations/'+'instances_train.json', 'w+'))
+    json.dump(val_dict, open(root_path+'annotations/'+'instances_val.json', 'w+'))
 
 if __name__ == '__main__':
-    to_coco('/home/rvlab/Documents/DRDvideo_processed/annotations/raw_labels/')
+    to_coco('/home/rvlab/Documents/DRDvideo_processed/')

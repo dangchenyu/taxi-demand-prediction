@@ -12,7 +12,7 @@ def get_video_writer(save_video_path, width, height):
                 pass
 
         return MuteVideoWriter()
-def draw_lines(video_path,save_video,save_frames=True):
+def draw_lines(video_path,save_video,save_frames=True,cut_frames=True):
     if os.path.isdir(video_path):
         path_list = os.listdir(video_path)
         for video in path_list:
@@ -25,11 +25,15 @@ def draw_lines(video_path,save_video,save_frames=True):
 
             while True:
                 ret, frame = capture.read()
-                if save_frames:
-                    img_save_path=os.path.join(save_video,'raw_frames',video_base_name+'_{:06d}.jpg'.format(frame_num))
-                    cv2.imwrite(img_save_path,frame)
+
                 if not ret:
                     break
+                if save_frames:
+                    img_save_path=os.path.join(save_video,'raw_frames',video_base_name+'_{:06d}.jpg'.format(frame_num))
+                    if cut_frames:
+                        cv2.imwrite(img_save_path,frame[80:,:640])
+                    else:
+                        cv2.imwrite(img_save_path, frame)
                 frame_num+=1
                 cv2.line(frame,(0,360),(1280,360),(0,255,0),1)
                 cv2.line(frame, (640, 0), (640, 720), (0, 255, 0), 1)

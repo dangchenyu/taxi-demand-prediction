@@ -262,7 +262,7 @@ def track_only(tracker, args):
         count = 0
         while True:
             ret, frame = capture.read()
-            frame = frame[:, :640]
+            frame = frame[80:, :640]
             if not ret:
                 break
             count += 1
@@ -286,7 +286,7 @@ def track_and_recognize(tracker, recognizer, args):
                                     # capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     while True:
         ret, frame = capture.read()
-        frame = frame[:, :640]
+        frame = frame[80:, :640]
 
         if not ret:
             break
