@@ -134,8 +134,9 @@ class TSN:
 
 
 class TSM:
-    def __init__(self, checkpoint):
-        self.model = MobileNetV2()
+    def __init__(self, checkpoint,num_segments):
+        self.model = MobileNetV2(segment=num_segments)
+        self.num_segments=num_segments
         if checkpoint is not None:
             sd = torch.load(checkpoint)
             sd = sd['state_dict']
@@ -157,14 +158,14 @@ class TSM:
                         sd[k.replace('new_fc', 'classifier')] = sd.pop(k)
             model_dict.update(sd)
             self.model.load_state_dict(model_dict)
-        self.shift_buffer = [torch.zeros([8, 3, 8, 8]),
-                             torch.zeros([8, 4, 4, 4]),
-                             torch.zeros([8, 4, 4, 4]),
-                             torch.zeros([8, 8, 2, 2]),
-                             torch.zeros([8, 8, 2, 2]),
-                             torch.zeros([8, 8, 2, 2]),
-                             torch.zeros([8, 12, 2, 2]),
-                             torch.zeros([8, 12, 2, 2]),
+        self.shift_buffer = [torch.zeros([self.num_segments, 3, 8, 8]),
+                             torch.zeros([self.num_segments, 4, 4, 4]),
+                             torch.zeros([self.num_segments, 4, 4, 4]),
+                             torch.zeros([self.num_segments, 8, 2, 2]),
+                             torch.zeros([self.num_segments, 8, 2, 2]),
+                             torch.zeros([self.num_segments, 8, 2, 2]),
+                             torch.zeros([self.num_segments, 12, 2, 2]),
+                             torch.zeros([self.num_segments, 12, 2, 2]),
                              ]
         self.model.eval()
 
@@ -286,17 +287,17 @@ def track_and_recognize(tracker, recognizer, args):
                                     # capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     while True:
         ret, frame = capture.read()
-        frame = frame[80:, :640]
 
         if not ret:
             break
+        frame = frame[80:, :640]
         tracker.tick(frame)
         frame = mot.utils.visualize_snapshot(frame, tracker)
 
         # Perform action recognition each second
         for tracklet in tracker.tracklets_active:
-            if tracklet.is_confirmed() and tracklet.is_detected() and len(tracklet.feature_history) >= 8:
-                samples = ramdom_sample([feature[1]['patch'] for feature in tracklet.feature_history], 8)
+            if tracklet.is_confirmed() and tracklet.is_detected() and len(tracklet.feature_history) >= args.num_segments:
+                samples = ramdom_sample([feature[1]['patch'] for feature in tracklet.feature_history], args.num_segments)
                 prediction = recognizer(samples)
                 action = np.argmax(prediction[0].detach().cpu())
                 if action == 0:
@@ -305,7 +306,7 @@ def track_and_recognize(tracker, recognizer, args):
                                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), thickness=1)
                 elif action == 1:
                     box = tracklet.last_detection.box
-                    frame = cv2.putText(frame, 'waving', (int(box[0] + 4), int(box[1]) - 8),
+                    frame = cv2.putText(frame, 'standing', (int(box[0] + 4), int(box[1]) - 8),
                                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), thickness=1)
 
         cv2.imshow('Demo', frame)
@@ -320,7 +321,7 @@ def track_and_recognize(tracker, recognizer, args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['track', 'action'], help='track only or recognize action too')
-    parser.add_argument('-d', '--detector_config', required=True, help='test config file of object detector')
+    parser.add_argument('-d', '--detector_config',  help='test config file of object detector')
     parser.add_argument('-dw', '--detector_checkpoint', required=True, help='checkpoint file of object detector')
     parser.add_argument('-r', '--recognizer_config', required=False, help='test config file of TSN action recognizer')
     parser.add_argument('-rw', '--recognizer_checkpoint', required=False,
@@ -335,12 +336,13 @@ if __name__ == '__main__':
     parser.add_argument('--detector', required=True, default='mmdetection',
                         help='choose detector(mmdetection/centernet/acsp)')
     parser.add_argument('--recognizer', required=True, default='TSN', help='choose action recognizer(TSN/TSM)')
+    parser.add_argument('--num_segments', default=4, help='set segments num for action part')
     args = parser.parse_args()
     if args.detector == 'mmdetection':
         detector = mot.detect.MMDetector(args.detector_config, args.detector_checkpoint)
     if args.detector == 'centernet':
         opt = opts()
-        opt.init()
+        opt.init(args.detector_checkpoint)
         detector = mot.detect.Centernet(opt)
     if args.tracker == 'tracktor':
         tracker = Tracktor(detector, sigma_active=0.6)
@@ -355,5 +357,5 @@ if __name__ == '__main__':
         if args.recognizer == 'TSN':
             recognizer = TSN(args.recognizer_config, args.recognizer_checkpoint)
         if args.recognizer == 'TSM':
-            recognizer = TSM(args.recognizer_checkpoint)
+            recognizer = TSM(args.recognizer_checkpoint,args.num_segments)
         track_and_recognize(tracker, recognizer, args)

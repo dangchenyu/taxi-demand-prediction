@@ -71,7 +71,7 @@ def extract_videos(tracklets,save_path):
         if len(tracklet.frame_history)>8:#threshold of min frames
             video_writer = cv2.VideoWriter(
                 os.path.join(save_path, action,
-                             '{}_{}_{}_{}.mp4'.format(base_video_name, target_id, start_frame, end_frame)),
+                             '{}_{}_{}_{}_{}.mp4'.format(base_video_name, target_id,action,start_frame, end_frame)),
                 cv2.VideoWriter_fourcc(*'mp4v'), 14, (64, 64))
             for idx,frame in enumerate(tracklet.frame_history):
                 bbox=list(map(int, tracklet.tracklet[idx]))
