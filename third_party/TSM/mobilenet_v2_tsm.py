@@ -1,43 +1,9 @@
+
 import torch.nn as nn
-from .transforms import *
-
 import torch
+import math
 
 
-class Identity(torch.nn.Module):
-    def forward(self, input):
-        return input
-
-
-class SegmentConsensus(torch.nn.Module):
-
-    def __init__(self, consensus_type, dim=1):
-        super(SegmentConsensus, self).__init__()
-        self.consensus_type = consensus_type
-        self.dim = dim
-        self.shape = None
-
-    def forward(self, input_tensor):
-        self.shape = input_tensor.size()
-        if self.consensus_type == 'avg':
-            output = input_tensor.mean(dim=self.dim, keepdim=True)
-        elif self.consensus_type == 'identity':
-            output = input_tensor
-        else:
-            output = None
-
-        return output
-
-
-class ConsensusModule(torch.nn.Module):
-
-    def __init__(self, consensus_type, dim=1):
-        super(ConsensusModule, self).__init__()
-        self.consensus_type = consensus_type if consensus_type != 'rnn' else 'identity'
-        self.dim = dim
-
-    def forward(self, input):
-        return SegmentConsensus(self.consensus_type, self.dim)(input)
 def conv_bn(inp, oup, stride):
     return nn.Sequential(
         nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
@@ -60,7 +26,7 @@ def make_divisible(x, divisible_by=8):
 
 
 class InvertedResidual(nn.Module):
-    def __init__(self, inp, oup, stride, expand_ratio):
+    def __init__(self, inp, oup, stride, expand_ratio,segment_num):
         super(InvertedResidual, self).__init__()
         self.stride = stride
         assert stride in [1, 2]
@@ -99,9 +65,8 @@ class InvertedResidual(nn.Module):
         else:
             return self.conv(x)
 
-
 class InvertedResidualWithShift(nn.Module):
-    def __init__(self, inp, oup, stride, expand_ratio):
+    def __init__(self, inp, oup, stride, expand_ratio,segment_num,fold_div=8):
         super(InvertedResidualWithShift, self).__init__()
         self.stride = stride
         assert stride in [1, 2]
@@ -110,6 +75,8 @@ class InvertedResidualWithShift(nn.Module):
 
         hidden_dim = int(inp * expand_ratio)
         self.use_res_connect = self.stride == 1 and inp == oup
+        self.n_segment=segment_num
+        self.fold_div=fold_div
         assert self.use_res_connect
 
         self.conv = nn.Sequential(
@@ -126,24 +93,29 @@ class InvertedResidualWithShift(nn.Module):
             nn.BatchNorm2d(oup),
         )
 
-    def forward(self, x, shift_buffer):
-        c = x.size(1)
-        x1, x2 = x[:, : c // 8], x[:, c // 8:]
+    def forward(self, x):
+        x_ori=x
+        nt, c, h, w = x.size()
+        n_batch = nt // self.n_segment
 
-        return x + self.conv(torch.cat((shift_buffer, x2), dim=1)), x1
+        x = x.view(n_batch, self.n_segment, c, h, w)
+
+        fold = c //  self.fold_div
+
+        out = torch.zeros_like(x)
+        # out[:, :-1, :fold] = x[:, 1:, :fold]  # shift left
+        # out[:, 1:, fold: 2 * fold] = x[:, :-1, fold: 2 * fold]
+        out[:, 1:, fold:] = x[:, :-1, fold:]
+
+        # out[:, :, 2 * fold:] = x[:, :, 2 * fold:]  # not shift
+        out=out.view(nt, c, h, w)
+
+        return x_ori + self.conv(out)
 
 
 class MobileNetV2(nn.Module):
-    def __init__(self, n_class=2, input_size=224, width_mult=1., partial_bn=True, segment=8,consensus_type='avg'):
+    def __init__(self, n_class=2, input_size=224, width_mult=1.,segment_num=4):
         super(MobileNetV2, self).__init__()
-        self.crop_size = input_size
-        self.scale_size = input_size * 256 // 224
-        self._enable_pbn = partial_bn
-        self.consensus_type = consensus_type
-        self.consensus = ConsensusModule(consensus_type)
-        self.num_segments=segment
-        self.ori_channel = segment * 3
-
         input_channel = 32
         last_channel = 1280
         interverted_residual_setting = [
@@ -159,6 +131,7 @@ class MobileNetV2(nn.Module):
         # building first layer
         assert input_size % 32 == 0
         # input_channel = make_divisible(input_channel * width_mult)  # first channel is always 32!
+        self.segment_num=segment_num
         self.last_channel = make_divisible(last_channel * width_mult) if width_mult > 1.0 else last_channel
         self.features = [conv_bn(3, input_channel, 2)]
         # building inverted residual blocks
@@ -169,11 +142,11 @@ class MobileNetV2(nn.Module):
             for i in range(n):
                 if i == 0:
                     block = InvertedResidualWithShift if global_idx in shift_block_idx else InvertedResidual
-                    self.features.append(block(input_channel, output_channel, s, expand_ratio=t))
+                    self.features.append(block(input_channel, output_channel, s, expand_ratio=t,segment_num=self.segment_num))
                     global_idx += 1
                 else:
                     block = InvertedResidualWithShift if global_idx in shift_block_idx else InvertedResidual
-                    self.features.append(block(input_channel, output_channel, 1, expand_ratio=t))
+                    self.features.append(block(input_channel, output_channel, 1, expand_ratio=t,segment_num=self.segment_num))
                     global_idx += 1
                 input_channel = output_channel
         # building last several layers
@@ -186,26 +159,16 @@ class MobileNetV2(nn.Module):
 
         self._initialize_weights()
 
-    def forward(self, x, *shift_buffer):
-        sample_len = 3
-
-        # x= self.transform(x)
-        x=x.view((-1, sample_len) + x.size()[-2:])
-
-        shift_buffer_idx = 0
-        out_buffer = []
+    def forward(self, x):
+        x=x.view((-1, 3) + x.size()[-2:])
         for f in self.features:
-            if isinstance(f, InvertedResidualWithShift):
-                x, s = f(x, shift_buffer[shift_buffer_idx])
-                shift_buffer_idx += 1
-                out_buffer.append(s)
-            else:
-                x = f(x)
+            x = f(x)
         x = x.mean(3).mean(2)
         x = self.classifier(x)
-        x = x.view((-1, self.num_segments) + x.size()[1:])
-        output = self.consensus(x)
-        return output.squeeze(1)
+        # x = x.view((1, self.segment_num) + x.size()[1:])
+        output = x.mean(dim=0, keepdim=True)
+
+        return output
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -222,88 +185,6 @@ class MobileNetV2(nn.Module):
                 m.weight.data.normal_(0, 0.01)
                 m.bias.data.zero_()
 
-    def get_optim_policies(self):
-        first_conv_weight = []
-        first_conv_bias = []
-        normal_weight = []
-        normal_bias = []
-        lr5_weight = []
-        lr10_bias = []
-        bn = []
-        custom_ops = []
-
-        conv_cnt = 0
-        bn_cnt = 0
-        for m in self.modules():
-            if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Conv1d) or isinstance(m, torch.nn.Conv3d):
-                ps = list(m.parameters())
-                conv_cnt += 1
-                if conv_cnt == 1:
-                    first_conv_weight.append(ps[0])
-                    if len(ps) == 2:
-                        first_conv_bias.append(ps[1])
-                else:
-                    normal_weight.append(ps[0])
-                    if len(ps) == 2:
-                        normal_bias.append(ps[1])
-            elif isinstance(m, torch.nn.Linear):
-                ps = list(m.parameters())
-                if False:
-                    lr5_weight.append(ps[0])
-                else:
-                    normal_weight.append(ps[0])
-                if len(ps) == 2:
-                    if False:
-                        lr10_bias.append(ps[1])
-                    else:
-                        normal_bias.append(ps[1])
-
-            elif isinstance(m, torch.nn.BatchNorm2d):
-                bn_cnt += 1
-                # later BN's are frozen
-                if not True or bn_cnt == 1:
-                    bn.extend(list(m.parameters()))
-            elif isinstance(m, torch.nn.BatchNorm3d):
-                bn_cnt += 1
-                # later BN's are frozen
-                if not True or bn_cnt == 1:
-                    bn.extend(list(m.parameters()))
-            elif len(m._modules) == 0:
-                if len(list(m.parameters())) > 0:
-                    raise ValueError("New atomic module type: {}. Need to give it a learning policy".format(type(m)))
-
-        return [
-            {'params': first_conv_weight, 'lr_mult': 1, 'decay_mult': 1,
-             'name': "first_conv_weight"},
-            {'params': first_conv_bias, 'lr_mult': 2, 'decay_mult': 0,
-             'name': "first_conv_bias"},
-            {'params': normal_weight, 'lr_mult': 1, 'decay_mult': 1,
-             'name': "normal_weight"},
-            {'params': normal_bias, 'lr_mult': 2, 'decay_mult': 0,
-             'name': "normal_bias"},
-            {'params': bn, 'lr_mult': 1, 'decay_mult': 0,
-             'name': "BN scale/shift"},
-            {'params': custom_ops, 'lr_mult': 1, 'decay_mult': 1,
-             'name': "custom_ops"},
-            # for fc
-            {'params': lr5_weight, 'lr_mult': 5, 'decay_mult': 1,
-             'name': "lr5_weight"},
-            {'params': lr10_bias, 'lr_mult': 10, 'decay_mult': 0,
-             'name': "lr10_bias"},
-        ]
-
-    def get_augmentation(self, flip=True):
-
-        if flip:
-            return torchvision.transforms.Compose([GroupMultiScaleCrop(self.crop_size, [1, .875, .75, .66]),
-                                                   GroupRandomHorizontalFlip(is_flow=False)])
-        else:
-            print('#' * 20, 'NO FLIP!!!')
-            return torchvision.transforms.Compose([GroupMultiScaleCrop(self.crop_size, [1, .875, .75, .66])])
-
-    def partialBN(self, enable):
-        self._enable_pbn = enable
-
 
 def mobilenet_v2_140():
     return MobileNetV2(width_mult=1.4)
@@ -311,19 +192,18 @@ def mobilenet_v2_140():
 
 if __name__ == '__main__':
     net = MobileNetV2()
-
-    x = torch.rand(8, 3, 224, 224)
-    shift_buffer = [torch.zeros([8, 3, 56, 56]),
-                    torch.zeros([8, 4, 28, 28]),
-                    torch.zeros([8, 4, 28, 28]),
-                    torch.zeros([8, 8, 14, 14]),
-                    torch.zeros([8, 8, 14, 14]),
-                    torch.zeros([8, 8, 14, 14]),
-                    torch.zeros([8, 12, 14, 14]),
-                    torch.zeros([8, 12, 14, 14]),
-                    torch.zeros([8, 20, 7, 7]),
-                    torch.zeros([8, 20, 7, 7])]
+    x = torch.rand(1, 3, 224, 224)
+    shift_buffer = [torch.zeros([1, 3, 56, 56]),
+                    torch.zeros([1, 4, 28, 28]),
+                    torch.zeros([1, 4, 28, 28]),
+                    torch.zeros([1, 8, 14, 14]),
+                    torch.zeros([1, 8, 14, 14]),
+                    torch.zeros([1, 8, 14, 14]),
+                    torch.zeros([1, 12, 14, 14]),
+                    torch.zeros([1, 12, 14, 14]),
+                    torch.zeros([1, 20, 7, 7]),
+                    torch.zeros([1, 20, 7, 7])]
     with torch.no_grad():
         for _ in range(10):
-            y, *shift_buffer = net(x, *shift_buffer)
+            y, shift_buffer = net(x, *shift_buffer)
             print([s.shape for s in shift_buffer])

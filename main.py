@@ -135,7 +135,7 @@ class TSN:
 
 class TSM:
     def __init__(self, checkpoint,num_segments):
-        self.model = MobileNetV2(segment=num_segments)
+        self.model = MobileNetV2()
         self.num_segments=num_segments
         if checkpoint is not None:
             sd = torch.load(checkpoint)
@@ -158,15 +158,7 @@ class TSM:
                         sd[k.replace('new_fc', 'classifier')] = sd.pop(k)
             model_dict.update(sd)
             self.model.load_state_dict(model_dict)
-        self.shift_buffer = [torch.zeros([self.num_segments, 3, 8, 8]),
-                             torch.zeros([self.num_segments, 4, 4, 4]),
-                             torch.zeros([self.num_segments, 4, 4, 4]),
-                             torch.zeros([self.num_segments, 8, 2, 2]),
-                             torch.zeros([self.num_segments, 8, 2, 2]),
-                             torch.zeros([self.num_segments, 8, 2, 2]),
-                             torch.zeros([self.num_segments, 12, 2, 2]),
-                             torch.zeros([self.num_segments, 12, 2, 2]),
-                             ]
+
         self.model.eval()
 
     def __call__(self, images):
@@ -175,7 +167,7 @@ class TSM:
         # images = np.expand_dims(images, 0)
         # images = images.astype(np.float32) - 128
 
-        return self.model(images, *self.shift_buffer)
+        return self.model(images)
 
 
 def ramdom_sample(images, num_segments):
@@ -285,9 +277,13 @@ def track_and_recognize(tracker, recognizer, args):
     capture = cv2.VideoCapture(args.video_path)
     # video_writer = get_video_writer(args.save_video, capture.get(cv2.CAP_PROP_FRAME_WIDTH),
                                     # capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    count=0
     while True:
-        ret, frame = capture.read()
 
+        ret, frame = capture.read()
+        if count<900:
+            count+=1
+            continue
         if not ret:
             break
         frame = frame[80:, :640]
@@ -299,7 +295,7 @@ def track_and_recognize(tracker, recognizer, args):
             if tracklet.is_confirmed() and tracklet.is_detected() and len(tracklet.feature_history) >= args.num_segments:
                 samples = ramdom_sample([feature[1]['patch'] for feature in tracklet.feature_history], args.num_segments)
                 prediction = recognizer(samples)
-                action = np.argmax(prediction[0].detach().cpu())
+                action = np.argmax(prediction.detach().cpu())
                 if action == 0:
                     box = tracklet.last_detection.box
                     frame = cv2.putText(frame, 'walking', (int(box[0] + 4), int(box[1]) - 8),

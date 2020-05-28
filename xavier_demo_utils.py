@@ -12,7 +12,10 @@ import math
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
+import torch
+import torch.nn as nn
 from sklearn import linear_model
+import skimage.measure
 # do not delete the next import https://devtalk.nvidia.com/default/topic/1038494/tensorrt/logicerror-explicit_context_dependent-failed-invalid-device-context-no-currently-active-context-/
 import pycuda.autoinit
 import time
@@ -108,7 +111,7 @@ def get_engine(model_info):
     except:
         # Fallback to building an engine if the engine cannot be loaded for any reason.
         engine = build_engine_caffe(model_info)
-        with open(model_info.engine_file, "wb") as f:
+        with open(model_info.engine_file, "w+") as f:
             f.write(engine.serialize())
             print('-------------------save engine-------------------')
         return engine
@@ -167,18 +170,13 @@ def get_input_patch(result_info):
     return input_patch
 
 
-# preprocess of image
-def preprocess_model(frame_gray, pagelocked_buffer, model_info, result_info, ind_objs=-1, crop=False):
-    temp = frame_gray.copy()
-    if crop:
-        temp = temp[int(result_info.objs[ind_objs].history_location[-1][1]):int(
-            result_info.objs[ind_objs].history_location[-1][3]),
-               int(result_info.objs[ind_objs].history_location[-1][0]):int(
-                   result_info.objs[ind_objs].history_location[-1][2])]
-    frame_resize = cv2.resize(temp, (model_info.input_shape[2], model_info.input_shape[1]))
-    frame_expand = np.expand_dims(frame_resize, axis=-1)
-    frame_expand = frame_expand / 256.0
-    frame_nor = frame_expand.transpose([2, 0, 1]).astype(trt.nptype(model_info.data_type)).ravel()
+# preprocess of imagecd l
+def preprocess_model(frame, pagelocked_buffer, model_info):
+    frame_resize = cv2.resize(frame, (model_info.input_shape[2], model_info.input_shape[1]))
+    mean = np.array([0.408, 0.447, 0.470], dtype=np.float32).reshape(1, 1, 3)
+    std = np.array([0.289, 0.274, 0.278], dtype=np.float32).reshape(1, 1, 3)
+    inp_image = ((frame_resize / 255. - mean) / std)
+    frame_nor = inp_image.transpose([2, 0, 1]).astype(trt.nptype(model_info.data_type)).ravel()
     np.copyto(pagelocked_buffer, frame_nor)
 
 
@@ -217,76 +215,120 @@ def preprocess_model(frame_gray, pagelocked_buffer, model_info, result_info, ind
 #     frame_expand = frame_expand / 256.0
 #     frame_nor = frame_expand.transpose([2, 0, 1]).astype(trt.nptype(model_info.data_type)).ravel()
 #     np.copyto(pagelocked_buffer, frame_nor)
+from numpy.lib.stride_tricks import as_strided
+
+def pool2d(A, kernel_size, stride, padding, pool_mode='max'):
+    '''
+    2D Pooling
+
+    Parameters:
+        A: input 2D array
+        kernel_size: int, the size of the window
+        stride: int, the stride of the window
+        padding: int, implicit zero paddings on both sides of the input
+        pool_mode: string, 'max' or 'avg'
+    '''
+    # Padding
+    A = np.pad(A, padding, mode='constant')
+
+    # Window view of A
+    output_shape = ((A.shape[0] - kernel_size)//stride + 1,
+                    (A.shape[1] - kernel_size)//stride + 1)
+    kernel_size = (kernel_size, kernel_size)
+    A_w = as_strided(A, shape = output_shape + kernel_size,
+                        strides = (stride*A.strides[0],
+                                   stride*A.strides[1]) + A.strides)
+    A_w = A_w.reshape(-1, *kernel_size)
+
+    # Return the result of pooling
+    if pool_mode == 'max':
+        return A_w.max(axis=(1,2)).reshape(output_shape)
+    elif pool_mode == 'avg':
+        return A_w.mean(axis=(1,2)).reshape(output_shape)
+def _nms(heat, kernel=3):
+    keep=np.zeros_like(heat)
+    hmax_person=pool2d(heat[0][0], kernel_size=3, stride=1, padding=1, pool_mode='max')
+    keep[0][0] = hmax_person == heat[0][0]
+    return heat * keep
+# def _nms(heat, kernel=3):
+#     pad = (kernel - 1) // 2
+#
+#     hmax = nn.functional.max_pool2d(
+#         torch.from_numpy(heat), (kernel, kernel), stride=1, padding=pad)
+#     keep = (hmax.numpy() == heat)
+#     return heat * keep
+def _transpose_and_gather_feat(feat, ind):
+    feat= feat.transpose(0,2,3,1)
+    feat = feat.reshape(feat.shape[0], -1, feat.shape[3])
+    feat = np.expand_dims(feat[0][ind[0]],axis=0)
+    return feat
+def _gather_feat(feat, ind, mask=None):
+    dim  = feat.size(2)
+    ind  = ind.unsqueeze(2).expand(ind.size(0), ind.size(1), dim)
+    feat = feat.gather(1, ind)
+    if mask is not None:
+        mask = mask.unsqueeze(2).expand_as(feat)
+        feat = feat[mask]
+        feat = feat.view(-1, dim)
+    return feat
+def _topk(scores, K=40):
+    batch, cat, height, width = scores.shape
+    score_reshape=scores.reshape(batch, cat, -1)
+    topk_inds_people = np.expand_dims(score_reshape[0][0].argsort()[-K:][::-1],axis=0)
+    topk_score_people=score_reshape[0][0][topk_inds_people]
+    topk_inds_people = topk_inds_people % (height * width)
+    topk_ys = (topk_inds_people / width).astype(np.int)
+    topk_xs = (topk_inds_people % width).astype(np.int)
+
+
+    topk_clses = np.zeros((1,K))
+
+
+    return topk_score_people, topk_inds_people, topk_clses, topk_ys, topk_xs
+def ctdet_decode(heat, wh, reg=None, cat_spec_wh=False, K=100):
+    batch, cat, height, width = heat.shape
+    # perform nms on heatmaps
+    heat = _nms(heat)
+
+
+    scores, inds, clses, ys, xs = _topk(heat, K=K)
+
+    reg = _transpose_and_gather_feat(reg, inds)
+    xs = xs.reshape(batch, K, 1) + reg[:, :, 0:1]
+    ys = ys.reshape(batch, K, 1) + reg[:, :, 1:2]
+
+    wh = _transpose_and_gather_feat(wh, inds)
+
+    clses = clses.reshape(batch, K, 1)
+    scores = scores.reshape(batch, K, 1)
+    bboxes = np.concatenate([xs - wh[..., 0:1] / 2,
+                        ys - wh[..., 1:2] / 2,
+                        xs + wh[..., 0:1] / 2,
+                        ys + wh[..., 1:2] / 2],axis=2)
+    detections = np.concatenate([bboxes, scores, clses], axis=2)
+
+    return detections
 
 
 def posprocess_detection(h_output, test_img, model_info):
-    def parse_heat_map_detection(out_heat_map_single, test_img, box_list, model_info):
-        def sigmoid(x):
-            return 1.0 / (1.0 + np.exp(-x))
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
 
-        def exponential(value):
-            return math.exp(value)
+    hm = sigmoid(h_output[0].reshape(1, 80, 128, 128))
+    wh = h_output[1].reshape(1, 2, 128, 128)
+    reg = h_output[2].reshape(1, 2, 128, 128)
+    dets = ctdet_decode(hm, wh, reg=reg)
 
-        sigmoid_v = np.vectorize(sigmoid)
-        exponential_v = np.vectorize(exponential)
-        ind_anchor = (int(math.log(test_img.shape[1] // out_heat_map_single.shape[0], 2)) - 5) * 3
-        out_heat_map_single = out_heat_map_single.reshape(
-            (out_heat_map_single.shape[0], out_heat_map_single.shape[1], 3, model_info.num_class + 5))
-        out_heat_map_single[:, :, :, 4] = sigmoid_v(out_heat_map_single[:, :, :, 4])
-        ind_info_obj = np.where(out_heat_map_single[:, :, :, 4] >= model_info.confidence)
-        info_obj = out_heat_map_single[ind_info_obj]
-        if not 0 == len(info_obj):
-            info_obj[:, 0:2] = sigmoid_v(info_obj[:, 0:2])
-            info_obj[:, 2:4] = exponential_v(info_obj[:, 2:4])
-        for ind_obj in range(len(info_obj)):
-            cls_list = info_obj[ind_obj][5:model_info.num_class + 5].tolist()
-            label = cls_list.index(max(cls_list))  # 0,1,2
-            obj_score = info_obj[ind_obj][4]
-            x = ((info_obj[ind_obj][0] + ind_info_obj[0][ind_obj]) / float(out_heat_map_single.shape[0])) * \
-                test_img.shape[1]
-            y = ((info_obj[ind_obj][1] + ind_info_obj[1][ind_obj]) / float(out_heat_map_single.shape[1])) * \
-                test_img.shape[0]
-            w = (((model_info.anchor_w[ind_info_obj[2][ind_obj] + ind_anchor]) * info_obj[ind_obj][2]) /
-                 model_info.input_shape[2]) * test_img.shape[1]
-            h = (((model_info.anchor_h[ind_info_obj[2][ind_obj] + ind_anchor]) * info_obj[ind_obj][3]) /
-                 model_info.input_shape[1]) * test_img.shape[0]
-            x1 = x - w * 0.5
-            x2 = x + w * 0.5
-            y1 = y - h * 0.5
-            y2 = y + h * 0.5
-            box_list.append([x1, y1, x2, y2, round(obj_score, 4), label + 1])
+    temp = 0
 
-    out_heat_map = []
-    for ind_out in range(len(model_info.output_name)):
-        length_out = int((h_output[ind_out].shape[0] / ((model_info.num_class + 1 + 4) * 3)) ** 0.5)
-        out_heat_map.append(
-            h_output[ind_out].reshape((1, (model_info.num_class + 1 + 4) * 3, length_out, length_out)).transpose(0, 3,
-                                                                                                                 2, 1)[
-                0])
-
-    box_list = []
-    output_box = []
-    for i in range(len(model_info.output_name)):
-        parse_heat_map_detection(out_heat_map[i], test_img, box_list, model_info)
-    if box_list:
-        retain_box_index = calculate_NMS(np.array(box_list), model_info.thresh_IoU)
-        for i in retain_box_index:
-            if test_img.shape[1] < box_list[i][0]:  # x1
-                box_list[i][0] = test_img.shape[1] - 1.0
-            if test_img.shape[0] < box_list[i][1]:  # y1
-                box_list[i][1] = test_img.shape[0] - 1.0
-            if test_img.shape[1] < box_list[i][2]:  # x2
-                box_list[i][2] = test_img.shape[1] - 1.0
-            if test_img.shape[0] < box_list[i][3]:  # y2
-                box_list[i][3] = test_img.shape[0] - 1.0
-            for ind_lable_location in range(len(box_list[i][:4])):
-                if 0 > box_list[i][ind_lable_location]:  # x1
-                    box_list[i][ind_lable_location] = 0.0
-            if ((box_list[i][2] - box_list[i][0]) < model_info.thresh_drop_small_obj) or (
-                    (box_list[i][3] - box_list[i][1]) < model_info.thresh_drop_small_obj):  # drop small obj
-                continue
-            output_box.append(box_list[i])
-    return output_box
+    # dets = ctdet_decode(hm, wh, reg=reg, cat_spec_wh=self.opt.cat_spec_wh, K=self.opt.K)
+    #
+    # if return_time:
+    #     return output, dets, forward_time
+    # else:
+    #     return output, dets
+    #
+    #     return output_box
 
 
 # pose processaction
@@ -406,7 +448,7 @@ def compare_result_info(list1):
 
 # to store model information
 class model_info(object):
-    def __init__(self, deploy_file, model_file, engine_file, input_shape=(1, 384, 768),
+    def __init__(self, deploy_file, model_file, engine_file, input_shape=(3, 512, 512),
                  output_name=["conv_45", "conv_53"], data_type=trt.float32, flag_fp16=True, max_workspace_size=1,
                  max_batch_size=1):
         self.deploy_file = deploy_file
@@ -604,12 +646,13 @@ class result_info(object):
         ######################add_actions
 
     def add_action(self, objs_action_age, objs_action_hand, objs_action_head, objs_action_pose, ind_objs):
-        if len(self.objs[ind_objs].history_pose) <5:
+        if len(self.objs[ind_objs].history_pose) < 5:
             self.objs[ind_objs].history_action.append(
                 [objs_action_age[-1], objs_action_hand[-1], objs_action_head[-1], objs_action_pose[-1]])
         else:
             self.update_queue_action_mutil(objs_action_age, objs_action_hand, objs_action_head, objs_action_pose,
                                            ind_objs)
+
     # def add_action(self, objs_action_age, objs_action_hand, objs_action_head, objs_action_pose, ind_objs):
     #     self.objs[ind_objs].history_action=[objs_action_age[-1], objs_action_hand[-1], objs_action_head[-1], objs_action_pose[-1]]
 
@@ -694,14 +737,15 @@ class object_CES(object):
         self.add_history_location(REG_LOCATION_DETECTION.predict(test_x)[0])
         self.add_num_disappeared()
 
+
 ###draw_warning####
-def stick_warning(sour_img=None,warning_im_path=None):
-    warning_img=cv2.imread(warning_im_path)
+def stick_warning(sour_img=None, warning_im_path=None):
+    warning_img = cv2.imread(warning_im_path)
     img = warning_img
-    im=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    im=cv2.resize(im,(56,56))
-    w,h=sour_img.shape[0]/2,sour_img.shape[1]/2
-    sour_img[w-56:w,h-56:h]=im
+    im = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    im = cv2.resize(im, (56, 56))
+    w, h = sour_img.shape[0] / 2, sour_img.shape[1] / 2
+    sour_img[w - 56:w, h - 56:h] = im
     return sour_img
 
 
@@ -767,11 +811,11 @@ def draw_result_on_image(frame_resize, result_info):
             if 1 == result_info.objs[ind_obj].type_obj:
                 temp_history_action = result_info.objs[ind_obj].history_action
                 update_frame_info = compare_result_info(temp_history_action)
-                print('temp_history_action', temp_history_action,update_frame_info)
+                print('temp_history_action', temp_history_action, update_frame_info)
                 # [[adult=0, child=1], [hand_in=0, hand_out=1], [head_in=0, head_out=1], [sit=0, squat=1, stand=2, lie=3]]
                 for ind_task_action in range(len(update_frame_info)):
                     if 0 == ind_task_action:
-                        if 0 == update_frame_info [ind_task_action]:
+                        if 0 == update_frame_info[ind_task_action]:
                             content_label_predict += '_adult'
                         elif 1 == update_frame_info[ind_task_action]:
                             content_label_predict += '_child'
@@ -792,11 +836,11 @@ def draw_result_on_image(frame_resize, result_info):
                             content_label_predict += '_squat'
                         elif 2 == update_frame_info[ind_task_action]:
                             content_label_predict += '_stand'
-                        elif 3 ==update_frame_info[ind_task_action]:
+                        elif 3 == update_frame_info[ind_task_action]:
                             content_label_predict += '_lie'
 
                 # ------------------- pose block --------------------
-                if result_info.predict_type=='average':
+                if result_info.predict_type == 'average':
                     if len(result_info.objs[ind_obj].history_pose) > 1:
                         joints_ava = get_pose_ava(result_info.objs[ind_obj].history_pose[:-1])
                         temp = result_info.objs[ind_obj].history_pose[-1].copy()
@@ -804,7 +848,7 @@ def draw_result_on_image(frame_resize, result_info):
                                             result_info.point_dis).astype(np.int32)
                     else:
                         pred = (result_info.objs[ind_obj].history_pose[-1]).astype(np.int32)
-                elif result_info.predict_type=='regression':
+                elif result_info.predict_type == 'regression':
                     if len(result_info.objs[ind_obj].history_pose) > 1:
                         joints_predicted = predict_obj_keypoints(result_info.objs[ind_obj].history_pose[:-1])
                         temp = result_info.objs[ind_obj].history_pose[-1].copy()
@@ -812,11 +856,11 @@ def draw_result_on_image(frame_resize, result_info):
                                             result_info.point_dis).astype(np.int32)
                     else:
                         pred = (result_info.objs[ind_obj].history_pose[-1]).astype(np.int32)
-                elif result_info.predict_type=='combine':
+                elif result_info.predict_type == 'combine':
                     if len(result_info.objs[ind_obj].history_pose) > 1:
                         joints_predicted = predict_obj_keypoints(result_info.objs[ind_obj].history_pose[:-1])
                         joints_ava = get_pose_ava(result_info.objs[ind_obj].history_pose[:-1])
-                        combine_predict_ava=(np.add(joints_predicted,joints_ava)/2.0).astype(np.int32)
+                        combine_predict_ava = (np.add(joints_predicted, joints_ava) / 2.0).astype(np.int32)
                         temp = result_info.objs[ind_obj].history_pose[-1].copy()
                         pred = get_pose_new(combine_predict_ava, temp,
                                             result_info.point_dis).astype(np.int32)
@@ -836,8 +880,9 @@ def draw_result_on_image(frame_resize, result_info):
                             fontFace=FONT_LABEL,
                             fontScale=FONT_SCALE, color=COLOR_LABEL, thickness=LINE_WIDTH_LABEL)
                 ###show_demo warning
-                if 'hand-out'==content_label_predict_split[ind_txt] or 'head-out'==content_label_predict_split[ind_txt]:
-                    frame_resize=stick_warning(frame_resize,'res_warning.jpg')
+                if 'hand-out' == content_label_predict_split[ind_txt] or 'head-out' == content_label_predict_split[
+                    ind_txt]:
+                    frame_resize = stick_warning(frame_resize, 'res_warning.jpg')
 
     # ------------------- objs loss block -------------------
     if result_info.num_objs_loss > result_info.thresh_num_objs_loss:
