@@ -1,35 +1,14 @@
-'''
-Function: the function for CES cabin demo
-Date: 20191031
-Author: Yizhang Xia, Chenyu Dang, Chao Xu
-Mail: xiayizhang@minieye.cc
-Note:
-
-'''
-
 import cv2
-import math
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
-import torch
-import torch.nn as nn
-from sklearn import linear_model
-import skimage.measure
-# do not delete the next import https://devtalk.nvidia.com/default/topic/1038494/tensorrt/logicerror-explicit_context_dependent-failed-invalid-device-context-no-currently-active-context-/
-import pycuda.autoinit
-import time
 from numpy.lib.stride_tricks import as_strided
 
 # ------------------- static parameters -------------------
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-REG_LOCATION_DETECTION = linear_model.LinearRegression()
-FONT_LABEL = cv2.FONT_HERSHEY_SIMPLEX
-COLOR_LABEL = (0, 0, 0)
-LINE_WIDTH_LABEL = 3
-FONT_SCALE = 1.5
 
 
+# convert caffemodel to tensorrt model
 class process_caffemodel(object):
     def __init__(self,model_info):
         self.model_info=model_info
@@ -93,18 +72,7 @@ class process_caffemodel(object):
         return context,h_input, d_input, h_output, d_output, stream
 
 
-def show_results(image, results, vis_thresh=0.5, num_classes=1):
-    for j in range(1, num_classes + 1):
-        for bbox in results[j]:
-            if bbox[4] > vis_thresh:
-                cv2.rectangle(image,
-                              (bbox[0], bbox[1]),
-                              (bbox[2], bbox[3]), (0, 255, 0), 1)
-    cv2.imshow('demo', image)
-    cv2.waitKey(1)
-
-
-# to store model information
+# process outputs of tensorrt
 class detection_block(object):
     def __init__(self, deploy_file, model_file, engine_file, input_shape=(3, 512, 512),
                  output_name=None, data_type=trt.float32, flag_fp16=True, max_workspace_size=1,
