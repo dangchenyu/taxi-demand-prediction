@@ -4,7 +4,7 @@ from .detect import Detection
 class Tracklet:
     min_time_lived = -1
 
-    def __init__(self, id, frame_id, detection, feature, max_ttl=30, max_feature_history=30,
+    def __init__(self, id, frame_id, detection, feature, max_ttl=5, max_feature_history=30,
                  max_detection_history=3000):
         self.id = id
         # Box coordinate of the last target position with (left, top, right, bottom).
@@ -29,7 +29,12 @@ class Tracklet:
         self.prediction = None
         # Whether the target was just detected or not.
         self.detected = True
-
+        self.if_first=True
+        self.buffer=[]
+        self.past_feat_action=[]
+        self.action=[]
+        self.wait_prob=[]
+        self.last_wait_prob=0
     def predict(self):
         if self.prediction is not None:
             return self.prediction.box

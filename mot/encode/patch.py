@@ -35,4 +35,4 @@ class ImagePatchEncoder(Encoder):
         if y_c > img.shape[0] - half_h:
             padded_img = cv2.copyMakeBorder(padded_img, 0, half_h, 0, 0, borderType=cv2.BORDER_REFLECT)
         return padded_img[int(y_base + y_c - half_h): int(y_base + y_c + half_h),
-               int(x_base + x_c - half_w): int(x_base + x_c + half_w), :]
+               int(x_base + x_c - half_w): int(x_base + x_c + half_w+0.5*half_w), :]

@@ -135,13 +135,13 @@ class detection_block(object):
         wh = h_output[1].reshape(1, 2, self.heat_shape, self.heat_shape)
         reg = h_output[2].reshape(1, 2, self.heat_shape, self.heat_shape)
 
-        dets = self.ctdet_decode(hm_person_sigmoid, wh, reg=reg, K=self.max_per_image)
-        dets = self.post_process(dets)
-        results = self.merge_outputs(dets)
+        dets = self._ctdet_decode(hm_person_sigmoid, wh, reg=reg, K=self.max_per_image)
+        dets = self._post_process(dets)
+        results = self._merge_outputs(dets)
 
         return results
 
-    def ctdet_decode(self, heat, wh, reg=None, K=20):
+    def _ctdet_decode(self, heat, wh, reg=None, K=20):
 
         def _nms(heat):
             def _pool2d(A, kernel_size, stride, padding, pool_mode='max'):
@@ -203,7 +203,7 @@ class detection_block(object):
 
         return detections
 
-    def post_process(self, dets, ):
+    def _post_process(self, dets, ):
         def _ctdet_post_process(dets, c, s, h, w, num_classes):
             # dets: batch x max_dets x dim
             # return 1-based class det dict
@@ -243,7 +243,7 @@ class detection_block(object):
             dets[0][j] = np.array(dets[0][j], dtype=np.float32).reshape(-1, 5)
         return dets[0]
 
-    def merge_outputs(self, detections):
+    def _merge_outputs(self, detections):
         results = {}
         for j in range(1, self.num_class + 1):
             results[j] = np.concatenate(

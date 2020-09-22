@@ -1,6 +1,6 @@
 import os
 import cv2
-import mmcv
+# import mmcv
 import torch
 import random
 import argparse
@@ -12,19 +12,22 @@ import mot.predict
 import numpy as np
 import torchvision
 import mot.associate
-from third_party.TSM import MobileNetV2,GroupNormalize,ToTorchFormatTensor
+from third_party.TSM import MobileNetV2, GroupNormalize, ToTorchFormatTensor
 from mot.tracker import Tracker
 from mot.tracklet import Tracklet
-from mmcv.runner import load_checkpoint
-from mmaction.models import build_recognizer
-
+from regressor import Box_reg
+from PIL import Image
+# from mmcv.runner import load_checkpoint
+# from mmaction.models import build_recognizer
+import time
 from opts import opts
+from torchvision import transforms
 
 
 class IoUTracker(Tracker):
     def __init__(self, detector, sigma_conf=0.4):
         metric = mot.metric.IoUMetric(use_prediction=True)
-        encoder = mot.encode.ImagePatchEncoder(resize_to=(32, 32))
+        encoder = mot.encode.ImagePatchEncoder(resize_to=(64, 64))
         matcher = mot.associate.HungarianMatcher(metric, sigma=0.1)
         predictor = mot.predict.KalmanPredictor()
         # predictor=None
@@ -108,35 +111,32 @@ class Tracktor(Tracker):
             self.predictor.initiate([new_tracklet])
 
 
-class TSN:
-    def __init__(self, config, checkpoint):
-        cfg = mmcv.Config.fromfile(config)
-
-        if cfg.get('cudnn_benchmark', False):
-            torch.backends.cudnn.benchmark = True
-        cfg.data.test.test_mode = True
-
-        if cfg.data.test.oversample == 'three_crop':
-            cfg.model.spatial_temporal_module.spatial_size = 8
-
-        self.model = build_recognizer(
-            cfg.model, train_cfg=None, test_cfg=cfg.test_cfg)
-        load_checkpoint(self.model, checkpoint, strict=True)
-
+class Taxi_reg:
+    def __init__(self, checkpoint):
+        self.model = Box_reg()
+        sd = torch.load(checkpoint)
+        self.model.load_state_dict(sd)
         self.model.eval()
 
-    def __call__(self, images):
-        images = np.array(images)
-        images = images.transpose((0, 3, 1, 2))
-        images = np.expand_dims(images, 0)
-        images = images.astype(np.float32) - 128
-        return self.model([1], None, return_loss=False, img_group_0=torch.Tensor(images))
+    def __call__(self, img):
+        patch_resize = cv2.resize(img, (32, 32))
+        img_pil = Image.fromarray(patch_resize).convert('RGB')
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+        ])
+        input = transform(img_pil)
+        input = torch.unsqueeze(input, 0)
+
+        output = self.model(input)
+        return output
 
 
 class TSM:
-    def __init__(self, checkpoint,num_segments):
-        self.model = MobileNetV2()
-        self.num_segments=num_segments
+    def __init__(self, checkpoint, num_segments):
+        self.model = MobileNetV2(n_class=2)
+        self.num_segments = num_segments
         if checkpoint is not None:
             sd = torch.load(checkpoint)
             sd = sd['state_dict']
@@ -155,38 +155,28 @@ class TSM:
                         sd[k.replace('.net', '')] = sd.pop(k)
                 for k in list(sd.keys()):
                     if 'new_fc' in k:
+                        print(sd[k])
                         sd[k.replace('new_fc', 'classifier')] = sd.pop(k)
             model_dict.update(sd)
             self.model.load_state_dict(model_dict)
 
         self.model.eval()
 
-    def __call__(self, images):
+    def __call__(self, images, *shift_buffer):
         # images = np.array(images)
         # images = images.transpose((0, 3, 1, 2))
         # images = np.expand_dims(images, 0)
         # images = images.astype(np.float32) - 128
 
-        return self.model(images)
+        return self.model(images, *shift_buffer)
 
 
-def ramdom_sample(images, num_segments):
-    total_images = len(images)
-    image_inds = []
-    segment_length = int(total_images / num_segments)
-    for i in range(num_segments):
-        image_inds.append(random.randint(segment_length * i, segment_length * i + segment_length - 1))
-    input_mean = [0.485, 0.456, 0.406]
-    input_std = [0.229, 0.224, 0.225]
+def process_frame():
     transform = torchvision.transforms.Compose([
-        ToTorchFormatTensor(),
-        GroupNormalize(input_mean, input_std)])
-    # for ind in image_inds:
-    #     cv2.imshow('templates',images[ind])
-    #     cv2.waitKey(0)
-    images_list=[transform(images[ind]) for ind in image_inds]
-    image_tensor=torch.cat(images_list,0)
-    return image_tensor
+        ToTorchFormatTensor(div=True),
+        GroupNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    return transform
 
 
 def get_video_writer(save_video_path, width, height):
@@ -206,31 +196,71 @@ def get_video_writer(save_video_path, width, height):
 def track_only(tracker, args):
     if os.path.isdir(args.video_path):
         path_list = os.listdir(args.video_path)
-        for action_name in path_list:
-            if action_name in ['walk']:
-                video_list = os.listdir(os.path.join(args.video_path, action_name))
-                for video in video_list:
-                    video_base_name = os.path.splitext(video)[0]
-                    capture = cv2.VideoCapture(os.path.join(args.video_path, action_name, video))
-                    video_writer = get_video_writer(os.path.join(args.save_video, action_name, video),
-                                                    capture.get(cv2.CAP_PROP_FRAME_WIDTH),
-                                                    capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    result_writer = open(os.path.join(args.save_video, action_name, video_base_name + '.txt'), 'w+')
+        num = 0
+        confirmed_num = 45
+        for video in path_list:
+            video_base_name = os.path.splitext(video)[0]
+            capture = cv2.VideoCapture(os.path.join(args.video_path, video))
 
-                    count = 0
-                    tracker.clear()
-                    while True:
-                        ret, frame = capture.read()
+            # result_writer = open(args.save_result + video_base_name + '_tracked_result.txt', 'w+')
 
-                        if not ret:
-                            break
-                        tracker.tick(frame)
-                        frame = mot.utils.visualize_snapshot(frame, tracker)
+            count = 0
+            id_pool = []
+            tracker.clear()
+            while True:
+                ret, frame = capture.read()
+                print('frame num', count)
+                if not ret:
+                    break
+                if count < 46800:
+                    count += 1
+                    continue
+                if 19800 < count < 46800:
+                    result_writer = open(args.save_result + '1-5' + '_tracked_result.txt', 'a+')
+                elif 46800 < count < 75000:
+                    result_writer = open(args.save_result + '6-10' + '_tracked_result.txt', 'a+')
+                elif 75600 < count < 102600:
+                    result_writer = open(args.save_result + '11-15' + '_tracked_result.txt', 'a+')
+                elif 102600 < count:
+                    result_writer = open(args.save_result + '16-20' + '_tracked_result.txt', 'a+')
+                else:
+                    result_writer = open(args.save_result + 'others' + '_tracked_result.txt', 'a+')
 
-                        # Perform action recognition each second
-                        for tracklet in tracker.tracklets_active:
-                            if tracklet.is_confirmed() and tracklet.is_detected() and len(
-                                    tracklet.feature_history) >= 3:
+                tracker.tick(frame)
+                frame = mot.utils.visualize_snapshot(frame, tracker)
+
+                for tracklet in tracker.tracklets_active:
+                    if tracklet.is_confirmed() and tracklet.is_detected() and len(
+                            tracklet.detection_history) >= confirmed_num:
+                        # confirm frame num
+                        # if tracklet.last_detection.box[3] - tracklet.last_detection.box[1] > 70:
+                        detection_history_array = np.array(
+                            [i[1] for i in tracklet.detection_history[-confirmed_num + 1:]])
+                        ave_dete = np.sum(detection_history_array, axis=0) / (confirmed_num - 1)
+                        if (ave_dete[3] - ave_dete[1]) > (
+                                ave_dete[2] - ave_dete[0]) * 2 and (
+                                ave_dete[3] - ave_dete[1]) > 110:
+                            if tracklet.id not in id_pool:
+                                id_pool.append(tracklet.id)
+                                print(len(id_pool))
+                            if tracklet.if_first:
+                                for index, box_item in enumerate(tracklet.detection_history[-confirmed_num + 1:]):
+
+                                    count_new = count - confirmed_num + 1 + index + 1
+                                    print("____", count_new)
+                                    if index == 0:
+                                        continue
+                                    result_writer.write(
+                                        '{:d}, {:d}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, -1, -1, -1, -1\n'.format(
+                                            count_new, tracklet.id,
+                                            box_item[1][0],
+                                            box_item[1][1],
+                                            box_item[1][2] - box_item[1][0],
+                                            box_item[1][3] - box_item[1][1]
+                                        ))
+                                tracklet.if_first = False
+                            else:
+                                print('after', count)
                                 result_writer.write(
                                     '{:d}, {:d}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, -1, -1, -1, -1\n'.format(
                                         count, tracklet.id,
@@ -240,24 +270,25 @@ def track_only(tracker, args):
                                         tracklet.last_detection.box[3] - tracklet.last_detection.box[1]
                                     ))
 
-                        cv2.imshow('Demo', frame)
-                        video_writer.write(frame)
-                        key = cv2.waitKey(1)
-                        if key == 27:
-                            break
+                cv2.imshow('Demo', frame)
+                key = cv2.waitKey(1)
+                if key == 27:
+                    break
 
-                        count += 1
+                count += 1
 
-                    video_writer.release()
-                    result_writer.close()
+                result_writer.close()
+
     else:
         capture = cv2.VideoCapture(args.video_path)
         count = 0
+
         while True:
             ret, frame = capture.read()
-            frame = frame[80:, :640]
             if not ret:
                 break
+            frame = frame[80:, :640]
+
             count += 1
 
             # if count<72:
@@ -268,71 +299,274 @@ def track_only(tracker, args):
             frame = mot.utils.visualize_snapshot(frame, tracker)
 
             cv2.imshow('Demo', frame)
-            key = cv2.waitKey(1)
+            key = cv2.waitKey(0)
             if key == 27:
                 break
 
 
-def track_and_recognize(tracker, recognizer, args):
-    capture = cv2.VideoCapture(args.video_path)
-    # video_writer = get_video_writer(args.save_video, capture.get(cv2.CAP_PROP_FRAME_WIDTH),
-                                    # capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    count=0
-    while True:
+def track_and_recognize(tracker, recognizer, regressor, args):
+    if os.path.isdir(args.video_path):
+        spot_list = os.listdir(args.video_path)
+        for spot in spot_list:
+            video_list = os.listdir(os.path.join(args.video_path, spot))
+            for video in video_list:
+                if video in ['M19040111460800061.mp4', 'M19040212172600021.mp4', 'M19031611152900021.mp4',
+                             'M19032415180200611.mp4',
+                             'M19032716550100221.mp4',
+                             'M19032614082200081.mp4',
+                             'M19032814123800641.mp4',
+                             'M19032908130200261.mp4',
+                             'M19032908130200261.mp4',
+                             'M19040411475100711.mp4',
+                             'M19031618103700211.mp4',
+                             'M19032815265400351.mp4'
+                             ]:
+                    capture = cv2.VideoCapture(os.path.join(args.video_path, spot, video))
 
-        ret, frame = capture.read()
-        if count<900:
-            count+=1
-            continue
-        if not ret:
-            break
-        frame = frame[80:, :640]
-        tracker.tick(frame)
-        frame = mot.utils.visualize_snapshot(frame, tracker)
+                    video_writer = get_video_writer(os.path.join(args.save_video, 'analyzed' + video), 640,
+                                                    640)
+                    count = 0
+                    # shift_buffer = [torch.zeros([1, 3, 16, 8]),
+                    #                 torch.zeros([1, 4, 8, 4]),
+                    #                 torch.zeros([1, 4, 8, 4]),
+                    #                 torch.zeros([1, 8, 4, 2]),
+                    #                 torch.zeros([1, 8, 4, 2]),
+                    #                 torch.zeros([1, 8, 4, 2]),
+                    #                 torch.zeros([1, 12, 4, 2]),
+                    #                 torch.zeros([1, 12, 4, 2])]
+                    shift_buffer = [torch.zeros([1, 3, 16, 16]),
+                                    torch.zeros([1, 4, 8, 8]),
+                                    torch.zeros([1, 4, 8, 8]),
+                                    torch.zeros([1, 8, 4, 4]),
+                                    torch.zeros([1, 8, 4, 4]),
+                                    torch.zeros([1, 8, 4, 4]),
+                                    torch.zeros([1, 12, 4, 4]),
+                                    torch.zeros([1, 12, 4, 4]),
+                                    torch.zeros([1, 20, 2, 2]),
+                                    torch.zeros([1, 20, 2, 2])]
 
-        # Perform action recognition each second
-        for tracklet in tracker.tracklets_active:
-            if tracklet.is_confirmed() and tracklet.is_detected() and len(tracklet.feature_history) >= args.num_segments:
-                samples = ramdom_sample([feature[1]['patch'] for feature in tracklet.feature_history], args.num_segments)
-                prediction = recognizer(samples)
-                action = np.argmax(prediction.detach().cpu())
-                if action == 0:
-                    box = tracklet.last_detection.box
-                    frame = cv2.putText(frame, 'walking', (int(box[0] + 4), int(box[1]) - 8),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), thickness=1)
-                elif action == 1:
-                    box = tracklet.last_detection.box
-                    frame = cv2.putText(frame, 'standing', (int(box[0] + 4), int(box[1]) - 8),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), thickness=1)
+                    while True:
+                        start_time = time.time()
+                        # if count<24000:
+                        #     count+=1
+                        #     ret, frame = capture.read()
 
-        cv2.imshow('Demo', frame)
-        # video_writer.write(frame)
-        key = cv2.waitKey(1)
-        if key == 27:
-            break
+                        # continue
+                        ret, frame = capture.read()
 
-    # video_writer.release()
+                        if not ret:
+                            break
+                        frame = frame[80:, :640]
+                        tracker.tick(frame)
+                        frame = mot.utils.visualize_snapshot(frame, tracker)
+
+                        # Perform action recognition each second
+                        for tracklet in tracker.tracklets_active:
+                            if tracklet.is_confirmed() and tracklet.is_detected() and len(
+                                    tracklet.feature_history) >= 2:
+                                # cv2.imshow('test',tracklet.feature_history[-1][1]['patch'])
+                                # cv2.waitKey(0)
+                                patch = cv2.cvtColor(tracklet.feature_history[-1][1]['patch'], cv2.COLOR_BGR2RGB)
+                                sample = process_frame()(patch)
+                                sample = torch.unsqueeze(sample, 0)
+
+                                if tracklet.buffer == []:
+                                    tracklet.buffer.append(shift_buffer)
+                                prediction, *out_buffer = recognizer(sample, *tracklet.buffer[-1])
+                                tracklet.buffer.append(out_buffer)
+                                tracklet.past_feat_action.append(prediction.detach().cpu())
+                                if len(tracklet.past_feat_action) >= 8:
+                                    feat_for_predict = tracklet.past_feat_action[-8:]
+                                    avg_logit = sum(feat_for_predict)
+
+                                    print(feat_for_predict, avg_logit)
+                                    action = np.argmax(avg_logit, axis=1)[0]
+                                    temp = 0
+                                else:
+                                    action = None
+                                if action == 0:
+                                    box = tracklet.last_detection.box
+                                    frame = cv2.putText(frame, 'walking', (int(box[0]), int(box[1]) - 25),
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), thickness=2)
+                                    frame = cv2.putText(frame, 'prob: 0', (int(box[0]), int(box[1]) - 4),
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), thickness=2)
+                                elif action == 1:
+                                    wait_prob = regressor(patch[0:int(patch.shape[0] / 2), :])
+                                    tracklet.wait_prob.append(wait_prob)
+                                    if len(tracklet.wait_prob) >= 3:
+
+                                        tracklet.last_wait_prob = ((sum(tracklet.wait_prob) - min(
+                                            tracklet.wait_prob) - max(tracklet.wait_prob)) / (
+                                                                           len(
+                                                                               tracklet.wait_prob) - 2)).detach().cpu().numpy()[
+                                            0][0]
+                                    else:
+                                        tracklet.last_wait_prob = \
+                                        (sum(tracklet.wait_prob) / len(tracklet.wait_prob)).detach().cpu().numpy()[0][0]
+                                    box = tracklet.last_detection.box
+                                    frame = cv2.putText(frame, 'standing', (int(box[0]), int(box[1]) - 25),
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), thickness=2)
+                                    frame = cv2.putText(frame, 'prob: %.2f' % tracklet.last_wait_prob,
+                                                        (int(box[0]), int(box[1]) - 4),
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (
+                                                        0, 255 * tracklet.last_wait_prob,
+                                                        255 * (1 - tracklet.last_wait_prob)),
+                                                        thickness=2)
+
+                        end_time = time.time()
+                        print(end_time - start_time, 'total people', len(tracker.tracklets_active))
+                        cv2.imshow('Demo', frame)
+                        count += 1
+                        video_writer.write(frame)
+                        key = cv2.waitKey(1)
+                        if key == 27:
+                            break
+
+                    video_writer.release()
+    else:
+        capture = cv2.VideoCapture(args.video_path)
+
+        # video_writer = get_video_writer(os.path.join(args.save_video, 'analyzed' + os.path.basename(args.video_path)), 640,
+        #                                 640)
+        count = 0
+        # shift_buffer = [torch.zeros([1, 3, 16, 8]),
+        #                 torch.zeros([1, 4, 8, 4]),
+        #                 torch.zeros([1, 4, 8, 4]),
+        #                 torch.zeros([1, 8, 4, 2]),
+        #                 torch.zeros([1, 8, 4, 2]),
+        #                 torch.zeros([1, 8, 4, 2]),
+        #                 torch.zeros([1, 12, 4, 2]),
+        #                 torch.zeros([1, 12, 4, 2])]
+        shift_buffer = [torch.zeros([1, 3, 16, 16]),
+                        torch.zeros([1, 4, 8, 8]),
+                        torch.zeros([1, 4, 8, 8]),
+                        torch.zeros([1, 8, 4, 4]),
+                        torch.zeros([1, 8, 4, 4]),
+                        torch.zeros([1, 8, 4, 4]),
+                        torch.zeros([1, 12, 4, 4]),
+                        torch.zeros([1, 12, 4, 4]),
+                        torch.zeros([1, 20, 2, 2]),
+                        torch.zeros([1, 20, 2, 2])]
+
+        while True:
+            start_time = time.time()
+            reg_end=0
+            act_end=0
+            reg_start=0
+            if count<150:
+                count+=1
+                ret, frame = capture.read()
+
+                continue
+            ret, frame = capture.read()
+            ret, frame = capture.read()
+
+            if not ret:
+                break
+            # frame = frame[80:, :640]
+            tracker.tick(frame)
+            frame = mot.utils.visualize_snapshot(frame, tracker)
+
+            # Perform action recognition each second
+            act_start=time.time()
+            for tracklet in tracker.tracklets_active:
+                if tracklet.is_confirmed() and tracklet.is_detected() and len(
+                        tracklet.feature_history) >= 2:
+                    # cv2.imshow('test',tracklet.feature_history[-1][1]['patch'])
+                    # cv2.waitKey(0)
+                    patch = cv2.cvtColor(tracklet.feature_history[-1][1]['patch'], cv2.COLOR_BGR2RGB)
+                    sample = process_frame()(patch)
+                    sample = torch.unsqueeze(sample, 0)
+
+                    if tracklet.buffer == []:
+                        tracklet.buffer.append(shift_buffer)
+                    prediction, *out_buffer = recognizer(sample, *tracklet.buffer[-1])
+                    tracklet.buffer.append(out_buffer)
+                    tracklet.past_feat_action.append(prediction.detach().cpu().numpy())
+                    if len(tracklet.past_feat_action) >= 10:
+                        # walk_ind=np.where(np.squeeze(tracklet.past_feat_action[- 8:],1)[:,0]>0)
+                        # if len(walk_ind[0])>=(8/2):
+                        #     action=0
+                        # else:
+                        #     action=1
+                        feat_for_predict = tracklet.past_feat_action[-10:]
+                        avg_logit = sum(feat_for_predict)
+
+                        # print(feat_for_predict, avg_logit,tracklet.id)
+                        action = np.argmax(avg_logit, axis=1)[0]
+                        temp = 0
+                    else:
+                        action = None
+                    act_end=time.time()
+                    if action == 0:
+                        box = tracklet.last_detection.box
+                        frame = cv2.putText(frame, 'walking', (int(box[0]), int(box[1]) - 25),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), thickness=2)
+                        frame = cv2.putText(frame, 'prob: 0', (int(box[0]), int(box[1]) - 4),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), thickness=2)
+                    elif action == 1:
+                        reg_start=time.time()
+                        wait_prob = regressor(patch[0:int(patch.shape[0] / 2), :])
+                        reg_end=time.time()
+                        tracklet.wait_prob.append(wait_prob)
+                        if len(tracklet.wait_prob) >= 3:
+
+                            tracklet.last_wait_prob = ((sum(tracklet.wait_prob) - min(
+                                tracklet.wait_prob) - max(tracklet.wait_prob)) / (
+                                                               len(
+                                                                   tracklet.wait_prob) - 2)).detach().cpu().numpy()[
+                                0][0]
+                        else:
+                            tracklet.last_wait_prob = \
+                                (sum(tracklet.wait_prob) / len(tracklet.wait_prob)).detach().cpu().numpy()[0][0]
+                        box = tracklet.last_detection.box
+                        frame = cv2.putText(frame, 'standing', (int(box[0]), int(box[1]) - 25),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), thickness=2)
+                        frame = cv2.putText(frame, 'prob: %.2f' % tracklet.last_wait_prob,
+                                            (int(box[0]), int(box[1]) - 4),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (
+                                                0, 255 * tracklet.last_wait_prob,
+                                                255 * (1 - tracklet.last_wait_prob)),
+                                            thickness=2)
+            if len(tracker.tracklets_to_kill)!=0:
+                temp=0
+            end_time = time.time()
+            print(end_time - start_time, 'total people', len(tracker.tracklets_active))
+            print('act_time:{},reg_time:{}'.format(act_end-act_start,reg_end-reg_start))
+
+            cv2.imshow('Demo', frame)
+            count += 1
+            # video_writer.write(frame)
+            key = cv2.waitKey(0)
+            if key == 27:
+                break
+
+        # video_writer.release()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['track', 'action'], help='track only or recognize action too')
-    parser.add_argument('-d', '--detector_config',  help='test config file of object detector')
+    parser.add_argument('-d', '--detector_config', help='test config file of object detector')
     parser.add_argument('-dw', '--detector_checkpoint', required=True, help='checkpoint file of object detector')
+    parser.add_argument('-rc', '--regressor_ck', required=True, help='checkpoint file of regressor')
+
     parser.add_argument('-r', '--recognizer_config', required=False, help='test config file of TSN action recognizer')
     parser.add_argument('-rw', '--recognizer_checkpoint', required=False,
                         help='checkpoint file of TSN action recognizer')
     parser.add_argument('-t', '--tracker', default='tracktor', choices=['tracktor', 'ioutracker'])
     parser.add_argument('-i', '--video_path', default='', required=False,
                         help='Path to the test video file or directory of test images. Leave it blank to use webcam.')
-    parser.add_argument('-o', '--save_video', default='', required=False,
+    parser.add_argument('-o', '--save_video',
+                        default='/home/rvlab/Documents/DRDvideos/may_contain_passemger/track_result/', required=False,
                         help='Path to the output video file. Leave it blank to disable.')
-    parser.add_argument('-s', '--save_result', default='', required=False,
+    parser.add_argument('-s', '--save_result',
+                        default='/home/rvlab/Documents/DRDvideos/campus/track_result/', required=False,
                         help='Path to the output track result file. Leave it blank to disable.')
     parser.add_argument('--detector', required=True, default='mmdetection',
                         help='choose detector(mmdetection/centernet/acsp)')
     parser.add_argument('--recognizer', required=True, default='TSN', help='choose action recognizer(TSN/TSM)')
-    parser.add_argument('--num_segments', default=4, help='set segments num for action part')
+    parser.add_argument('--num_segments', default=6, help='set segments num for action part')
     args = parser.parse_args()
     if args.detector == 'mmdetection':
         detector = mot.detect.MMDetector(args.detector_config, args.detector_checkpoint)
@@ -350,8 +584,8 @@ if __name__ == '__main__':
     if args.mode == 'track':
         track_only(tracker, args)
     elif args.mode == 'action':
-        if args.recognizer == 'TSN':
-            recognizer = TSN(args.recognizer_config, args.recognizer_checkpoint)
+
         if args.recognizer == 'TSM':
-            recognizer = TSM(args.recognizer_checkpoint,args.num_segments)
-        track_and_recognize(tracker, recognizer, args)
+            recognizer = TSM(args.recognizer_checkpoint, args.num_segments)
+        regressor = Taxi_reg(args.regressor_ck)
+        track_and_recognize(tracker, recognizer, regressor, args)

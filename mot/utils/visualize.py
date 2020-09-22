@@ -167,5 +167,5 @@ def visualize_snapshot(frame, tracker, confirmed_only=True, detected_only=True, 
     image = draw_targets(frame, tracker.tracklets_active,
                          confirmed_only=confirmed_only, detected_only=detected_only, draw_centers=draw_centers,
                          draw_predictions=draw_predictions, draw_skeletons=draw_skeletons)
-    image = draw_frame_num(image, tracker.frame_num)
+    # image = draw_frame_num(image, tracker.frame_num)
     return image

@@ -5,8 +5,8 @@ from .tracklet import Tracklet
 
 
 class Tracker:
-    def __init__(self, detector, encoders, matcher, predictor=None, last_frame=None, max_ttl=3, max_feature_history=30,
-                 max_detection_history=3000, min_time_lived=0):
+    def __init__(self, detector, encoders, matcher, predictor=None, last_frame=None, max_ttl=30, max_feature_history=30,
+                 max_detection_history=3000, min_time_lived=5):
         self.detector = detector
         self.encoders = encoders
         self.matcher = matcher
@@ -98,17 +98,17 @@ class Tracker:
                                                      detection_features[col_ind[i]])
 
         # Deal with unmatched tracklets
-        tracklets_to_kill = []
+        self.tracklets_to_kill = []
         unmatched_tracklets = []
         for i in range(len(self.tracklets_active)):
             if i not in row_ind:
                 if self.tracklets_active[i].fade():
-                    tracklets_to_kill.append(self.tracklets_active[i])
+                    self.tracklets_to_kill.append(self.tracklets_active[i])
                 else:
                     unmatched_tracklets.append(self.tracklets_active[i])
 
         # Kill tracklets that are unmatched for a while
-        for tracklet in tracklets_to_kill:
+        for tracklet in self.tracklets_to_kill:
             self.kill_tracklet(tracklet)
 
         # Create new tracklets with unmatched detections
@@ -160,5 +160,5 @@ class Tracker:
 
     def kill_tracklet(self, tracklet):
         self.tracklets_active.remove(tracklet)
-        if tracklet.time_lived >= self.min_time_lived:
-            self.tracklets_finished.append(tracklet)
+        # if tracklet.time_lived >= self.min_time_lived:
+        #     self.tracklets_finished.append(tracklet)

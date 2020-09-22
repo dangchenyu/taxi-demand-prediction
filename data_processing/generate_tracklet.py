@@ -1,15 +1,14 @@
-import os
-from third_party.mmaction.data_tools.climbing.crop_video_patches import *
+from third_party.mmaction.data_tools.pedestrian_action.crop_video_patches import *
 class Tracklet(object):
-    def __init__(self,id,box,action):
+    def __init__(self,id,box,frame_num,action):
         self.id=id
-        self.bbox=box
-        self.action=action
-        self.tracklet=[]
-        self.frame_history=[]
+        self.action=[action]
+        self.tracklet=[box]
+        self.frame_history=[frame_num]
     def update(self,bbox,frame_num):
         self.tracklet.append(bbox)
         self.frame_history.append(frame_num)
+
 def crop_imgs(img, x_c, y_c, window_size):
     x_base = 0
     y_base = 0
@@ -50,7 +49,7 @@ def generate_segments(root_path):
                 if obj_id+action not in id_pool:
 
                     id_pool.append(obj_id+action)
-                    obj=Tracklet(obj_id,bbox,action)
+                    obj=Tracklet(obj_id,bbox,frame_num,action)
                     tracklets[obj_id+action]=obj
                 else:
                     tracklets[obj_id+action].update(bbox,frame_num)
@@ -60,7 +59,7 @@ def extract_videos(tracklets,save_path):
     rawframes_dir='/home/rvlab/Documents/DRDvideo_processed/raw_frames/'
     for tracklet in tracklets.values():
         data=None
-        action=tracklet.action
+        action=tracklet.action[0]
         if not os.path.isdir(os.path.join(save_path, action)):
             os.makedirs(os.path.join(save_path, action))
         target_id = tracklet.id

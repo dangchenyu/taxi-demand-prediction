@@ -64,7 +64,6 @@ class InvertedResidual(nn.Module):
         else:
             return self.conv(x)
 
-
 class InvertedResidualWithShift(nn.Module):
     def __init__(self, inp, oup, stride, expand_ratio):
         super(InvertedResidualWithShift, self).__init__()
@@ -109,8 +108,7 @@ class MobileNetV2(nn.Module):
             [6, 32, 3, 2],
             [6, 64, 4, 2],
             [6, 96, 3, 1],
-            [6, 160, 3, 2],
-            [6, 320, 1, 1],
+
         ]
 
         # building first layer
@@ -192,5 +190,5 @@ if __name__ == '__main__':
                     torch.zeros([1, 20, 7, 7])]
     with torch.no_grad():
         for _ in range(10):
-            y, *shift_buffer = net(x, *shift_buffer)
+            y, shift_buffer = net(x, *shift_buffer)
             print([s.shape for s in shift_buffer])
